@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (without the leading v), e.g. 0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -q
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $version = $env:GITHUB_REF -replace '^refs/tags/v', ''
+          } else {
+            $version = '${{ github.event.inputs.version }}'
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          # The tag must match src/oledify/__init__.py, or the artefacts would be mislabelled.
+          $declared = (python -c "import sys; sys.path.insert(0, 'src'); import oledify; print(oledify.__version__)").Trim()
+          if ($declared -ne $version) {
+            Write-Error "Tag version $version does not match __version__ $declared"
+            exit 1
+          }
+
+      - name: Build with Nuitka
+        run: python scripts/build.py
+
+      - name: Create portable zip
+        shell: pwsh
+        run: |
+          $name = "OLEDify-${{ steps.version.outputs.version }}-portable.zip"
+          Compress-Archive -Path build/dist/OLEDify -DestinationPath "build/$name"
+
+      - name: Ensure Inno Setup is available
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Inno Setup not found; installing via Chocolatey"
+            choco install innosetup --no-progress -y
+          }
+          if (-not (Test-Path $iscc)) { Write-Error "ISCC.exe still not found at $iscc"; exit 1 }
+          "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build installer
+        shell: pwsh
+        run: '& "$env:ISCC" /DMyAppVersion=${{ steps.version.outputs.version }} installer\oledify.iss'
+
+      - name: Extract changelog notes
+        id: notes
+        shell: pwsh
+        run: |
+          python scripts/changelog_notes.py ${{ steps.version.outputs.version }} > release-notes.md
+          Get-Content release-notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OLEDify-${{ steps.version.outputs.version }}
+          path: |
+            build/OLEDify-*-portable.zip
+            build/OLEDify-Setup-*.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OLEDify ${{ steps.version.outputs.version }}
+          body_path: release-notes.md
+          files: |
+            build/OLEDify-${{ steps.version.outputs.version }}-portable.zip
+            build/OLEDify-Setup-${{ steps.version.outputs.version }}.exe
