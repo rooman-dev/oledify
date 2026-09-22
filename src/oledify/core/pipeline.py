@@ -1,6 +1,8 @@
 """Processing pipeline: load -> fit -> crush -> deband -> save. No Qt."""
 
 import os
+import threading
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +15,12 @@ from oledify.core.oled import crush_blacks, true_black_percent
 from oledify.core.resize import fit_image, is_upscale
 
 _HIGH_BIT_MODES = ("I", "I;16", "I;16B", "I;16L", "I;16N")
+
+ProgressCallback = Callable[[int, int], None]
+
+
+class Cancelled(Exception):
+    """Stored in process_batch results for a source skipped because the batch was cancelled."""
 
 
 @dataclass
@@ -74,22 +82,87 @@ def process_file(
     out_dir: str | Path,
     targets: list[tuple[int, int]],
     settings: Settings,
+    on_progress: ProgressCallback | None = None,
+    cancel: threading.Event | None = None,
 ) -> list[tuple[Path, dict]]:
     """Load src once, then process and save it for each (width, height) target.
 
     Targets run in parallel threads (NumPy and Pillow release the GIL for the heavy
     work); results are returned in the same order as targets.
+
+    on_progress(done, total) is called after each target is saved; calls are
+    serialised and done only increases. If cancel is set, targets not yet started
+    are skipped and left out of the results; running ones finish.
     """
     if not targets:
         return []
     img = load_image(src)
     out_dir = Path(out_dir)
+    total = len(targets)
+    done = 0
+    lock = threading.Lock()
 
-    def run(target: tuple[int, int]) -> tuple[Path, dict]:
+    def run(target: tuple[int, int]) -> tuple[Path, dict] | None:
+        nonlocal done
+        if cancel is not None and cancel.is_set():
+            return None
         target_w, target_h = target
         out, stats = process(img, target_w, target_h, settings)
         path = out_dir / output_name(src, target_w, target_h, settings.fmt)
-        return save_image(out, path, fmt=settings.fmt, quality=settings.quality), stats
+        result = save_image(out, path, fmt=settings.fmt, quality=settings.quality), stats
+        with lock:
+            done += 1
+            if on_progress is not None:
+                on_progress(done, total)
+        return result
 
     with ThreadPoolExecutor(max_workers=min(len(targets), os.cpu_count() or 4, 4)) as pool:
-        return list(pool.map(run, targets))
+        results = list(pool.map(run, targets))
+    return [result for result in results if result is not None]
+
+
+def process_batch(
+    sources: list[str | Path],
+    out_dir: str | Path,
+    targets: list[tuple[int, int]],
+    settings: Settings,
+    on_progress: ProgressCallback | None = None,
+    cancel: threading.Event | None = None,
+    overrides: Mapping[str | Path, Settings] | None = None,
+) -> dict[Path, list[tuple[Path, dict]] | Exception]:
+    """Run process_file for each source; one failing source never stops the others.
+
+    Returns {source: results or the exception it raised}, in source order (duplicates
+    removed). Sources skipped because cancel was set map to a Cancelled exception.
+    on_progress(done, total) counts targets across the whole batch, where
+    total = sources x targets; a failed source counts all its targets as done.
+    overrides gives per-source Settings (e.g. a crop focus), falling back to settings.
+    """
+    unique = list(dict.fromkeys(Path(src) for src in sources))
+    per_source = {Path(src): value for src, value in (overrides or {}).items()}
+    total = len(unique) * len(targets)
+    results: dict[Path, list[tuple[Path, dict]] | Exception] = {}
+
+    for index, src in enumerate(unique):
+        if cancel is not None and cancel.is_set():
+            results[src] = Cancelled(f"skipped {src.name}: batch cancelled")
+            continue
+        offset = index * len(targets)
+
+        def progress(done: int, _total: int, offset: int = offset) -> None:
+            on_progress(offset + done, total)
+
+        try:
+            results[src] = process_file(
+                src,
+                out_dir,
+                targets,
+                per_source.get(src, settings),
+                on_progress=progress if on_progress is not None else None,
+                cancel=cancel,
+            )
+        except Exception as exc:  # any failure is reported for this source; carry on with the rest
+            results[src] = exc
+            if on_progress is not None and targets:
+                on_progress(offset + len(targets), total)
+    return results

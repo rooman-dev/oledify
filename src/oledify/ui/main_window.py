@@ -1,41 +1,59 @@
-"""Main application window: open an image, tune the black crush live, export presets."""
+"""Main application window: load images, tune the black crush live, export presets in batch."""
 
 import os
+import threading
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QThreadPool, QTimer, QUrl, Qt
-from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent, QImage
+from PySide6.QtCore import QSize, QThreadPool, QTimer, QUrl, Qt
+from PySide6.QtGui import QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QFileDialog,
     QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListView,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
     QSlider,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
 
 from oledify import __version__
-from oledify.core.pipeline import Settings
+from oledify.core.pipeline import Cancelled, Settings
 from oledify.core.resize import is_upscale
 from oledify.ui.compare_view import CompareView
 from oledify.ui.export_panel import ExportPanel
-from oledify.ui.worker import ExportTask, FitKey, LoadTask, PreviewTask, WorkerSignals, preview_size
+from oledify.ui.worker import (
+    THUMB_MAX_SIDE,
+    BatchExportTask,
+    FitKey,
+    LoadTask,
+    PreviewTask,
+    ThumbnailTask,
+    WorkerSignals,
+    preview_size,
+)
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 DEBOUNCE_MS = 150
 PANEL_WIDTH = 300
+LIST_WIDTH = 210
 CENTER = (0.5, 0.5)
 PRESET_LABEL_ROLE = Qt.ItemDataRole.UserRole + 1
+PATH_ROLE = Qt.ItemDataRole.UserRole
+MAX_NAMES_IN_SUMMARY = 3
 
 
 class SliderRow(QWidget):
@@ -62,6 +80,26 @@ class SliderRow(QWidget):
 
     def value(self) -> int:
         return self.slider.value()
+
+
+def normalize_path(path: str | Path) -> str:
+    return os.path.normpath(os.path.abspath(path))
+
+
+def is_image_file(path: str | Path) -> bool:
+    return str(path).lower().endswith(IMAGE_EXTENSIONS)
+
+
+def expand_paths(paths: list[str | Path]) -> list[str]:
+    """Supported image files from paths; folders contribute their direct children, sorted by name."""
+    files: list[str] = []
+    for path in map(Path, paths):
+        if path.is_dir():
+            children = sorted((p for p in path.iterdir() if p.is_file() and is_image_file(p)), key=lambda p: p.name.lower())
+            files.extend(normalize_path(p) for p in children)
+        elif path.is_file() and is_image_file(path):
+            files.append(normalize_path(path))
+    return list(dict.fromkeys(files))
 
 
 def focus_to_center(
@@ -91,12 +129,16 @@ def focus_to_center(
     )
 
 
+def plural(count: int, word: str) -> str:
+    return f"{count} {word}{'' if count == 1 else 's'}"
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"OLEDify {__version__}")
         self.setAcceptDrops(True)
-        self.resize(1360, 860)
+        self.resize(1500, 880)
 
         self._pool = QThreadPool.globalInstance()
         self._signals = WorkerSignals(self)
@@ -104,16 +146,21 @@ class MainWindow(QMainWindow):
         self._signals.load_failed.connect(self._on_load_failed)
         self._signals.rendered.connect(self._on_rendered)
         self._signals.render_failed.connect(self._on_render_failed)
+        self._signals.thumbnail_ready.connect(self._on_thumbnail_ready)
+        self._signals.thumbnail_failed.connect(self._on_thumbnail_failed)
+        self._signals.export_progress.connect(self._on_export_progress)
         self._signals.export_finished.connect(self._on_export_finished)
         self._signals.export_failed.connect(self._on_export_failed)
 
         self._load_id = 0
         self._render_id = 0
+        self._items: dict[str, QListWidgetItem] = {}
+        self._focus_by_path: dict[str, tuple[float, float]] = {}
         self._source: np.ndarray | None = None
         self._source_path: str | None = None
-        self._focus = CENTER
         self._fitted_key: FitKey | None = None
         self._fitted: np.ndarray | None = None
+        self._cancel_event: threading.Event | None = None
         self._last_export_dir: str | None = None
 
         self._debounce = QTimer(self)
@@ -121,12 +168,45 @@ class MainWindow(QMainWindow):
         self._debounce.setInterval(DEBOUNCE_MS)
         self._debounce.timeout.connect(self._request_render)
 
+        # --- left: file list ---
+        placeholder = QPixmap(THUMB_MAX_SIDE, THUMB_MAX_SIDE * 9 // 16)
+        placeholder.fill(QColor(45, 45, 45))
+        self._placeholder_icon = QIcon(placeholder)
+        self._broken_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning)
+
+        self.file_list = QListWidget()
+        self.file_list.setViewMode(QListView.ViewMode.IconMode)
+        self.file_list.setIconSize(QSize(THUMB_MAX_SIDE, THUMB_MAX_SIDE * 9 // 16))
+        self.file_list.setGridSize(QSize(THUMB_MAX_SIDE + 16, THUMB_MAX_SIDE * 9 // 16 + 40))
+        self.file_list.setResizeMode(QListView.ResizeMode.Adjust)
+        self.file_list.setMovement(QListView.Movement.Static)
+        self.file_list.setWordWrap(True)
+        self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.file_list.currentItemChanged.connect(self._on_current_item_changed)
+
+        remove_button = QPushButton("Remove")
+        remove_button.clicked.connect(self.remove_selected)
+        clear_button = QPushButton("Clear")
+        clear_button.clicked.connect(self.clear_files)
+        list_buttons = QHBoxLayout()
+        list_buttons.addWidget(remove_button)
+        list_buttons.addWidget(clear_button)
+
+        left = QWidget()
+        left.setFixedWidth(LIST_WIDTH)
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(QLabel("Images"))
+        left_layout.addWidget(self.file_list)
+        left_layout.addLayout(list_buttons)
+
+        # --- centre: compare view ---
         self.compare = CompareView()
         self.compare.focus_clicked.connect(self._on_focus_clicked)
 
         # --- right panel ---
-        open_button = QPushButton("Open image…")
-        open_button.clicked.connect(self._choose_file)
+        open_button = QPushButton("Open images…")
+        open_button.clicked.connect(self._choose_files)
 
         preview_box = QGroupBox("Preview")
         preview_layout = QVBoxLayout(preview_box)
@@ -136,7 +216,7 @@ class MainWindow(QMainWindow):
         self.upscale_label.setWordWrap(True)
         self.upscale_label.setStyleSheet("color: #f5c518;")
         self.upscale_label.hide()
-        self.focus_hint = QLabel("Click the OLED side to set the crop focus.")
+        self.focus_hint = QLabel("Click the OLED side to set this image's crop focus.")
         self.focus_hint.setWordWrap(True)
         self.focus_hint.setEnabled(False)
         preview_layout.addWidget(QLabel("Preview size"))
@@ -175,6 +255,7 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         layout = QHBoxLayout(central)
+        layout.addWidget(left)
         layout.addWidget(self.compare, stretch=1)
         layout.addWidget(scroll)
         self.setCentralWidget(central)
@@ -184,16 +265,21 @@ class MainWindow(QMainWindow):
         self.black_label = QLabel("True black: –")
         self.time_label = QLabel("")
         self.progress = QProgressBar()
-        self.progress.setRange(0, 0)  # busy indicator: process_file reports no per-target progress
-        self.progress.setMaximumWidth(160)
+        self.progress.setFormat("%v / %m")
+        self.progress.setMaximumWidth(180)
         self.progress.hide()
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self._cancel_export)
+        self.cancel_button.hide()
         self.export_label = QLabel()
         self.export_label.hide()
         self.open_folder_button = QPushButton("Open folder")
         self.open_folder_button.clicked.connect(self._open_export_folder)
         self.open_folder_button.hide()
+        # Note: never use statusBar().showMessage() while these are visible; it hides them.
         status = self.statusBar()
         status.addWidget(self.progress)
+        status.addWidget(self.cancel_button)
         status.addWidget(self.export_label)
         status.addWidget(self.open_folder_button)
         status.addPermanentWidget(self.size_label)
@@ -202,59 +288,147 @@ class MainWindow(QMainWindow):
 
         self._rebuild_preview_combo()
 
-    # --- opening files ---------------------------------------------------
+    # --- file list -------------------------------------------------------
 
-    def _choose_file(self) -> None:
+    def paths(self) -> list[str]:
+        return [self.file_list.item(row).data(PATH_ROLE) for row in range(self.file_list.count())]
+
+    def _choose_files(self) -> None:
         patterns = " ".join(f"*{ext}" for ext in IMAGE_EXTENSIONS)
-        path, _ = QFileDialog.getOpenFileName(self, "Open image", "", f"Images ({patterns})")
-        if path:
-            self.open_image(path)
+        paths, _ = QFileDialog.getOpenFileNames(self, "Open images", "", f"Images ({patterns})")
+        if paths:
+            self.add_files(paths)
 
-    def open_image(self, path: str | Path) -> None:
-        self._load_id += 1
-        self._render_id += 1  # anything still rendering belongs to the previous image
-        self.statusBar().showMessage(f"Loading {Path(path).name}…")
-        self._pool.start(LoadTask(self._load_id, path, self._signals))
+    def add_files(self, paths: list[str | Path]) -> list[str]:
+        """Add image files (and supported files inside folders); returns the newly added paths."""
+        added = []
+        for path in expand_paths(paths):
+            if path in self._items:
+                continue
+            item = QListWidgetItem(self._placeholder_icon, Path(path).name)
+            item.setData(PATH_ROLE, path)
+            item.setToolTip(path)
+            self.file_list.addItem(item)
+            self._items[path] = item
+            added.append(path)
+            self._pool.start(ThumbnailTask(path, self._signals))
+        self._on_files_changed()
+        if added and self.file_list.currentItem() is None:
+            self.file_list.setCurrentItem(self._items[added[0]])
+        return added
+
+    def remove_selected(self) -> None:
+        selected = self.file_list.selectedItems()
+        if not selected:
+            return
+        previous = self.file_list.currentItem()
+        self.file_list.blockSignals(True)
+        for item in selected:
+            path = item.data(PATH_ROLE)
+            self._items.pop(path, None)
+            self._focus_by_path.pop(path, None)
+            self.file_list.takeItem(self.file_list.row(item))
+        self.file_list.blockSignals(False)
+        current = self.file_list.currentItem()
+        if current is not previous or previous in selected:
+            self._on_current_item_changed(current, None)
+        self._on_files_changed()
+
+    def clear_files(self) -> None:
+        self.file_list.blockSignals(True)
+        self.file_list.clear()
+        self.file_list.blockSignals(False)
+        self._items.clear()
+        self._focus_by_path.clear()
+        self._on_current_item_changed(None, None)
+        self._on_files_changed()
+
+    def _on_files_changed(self) -> None:
+        self.export_panel.set_files(self.paths())
+
+    def _on_current_item_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if current is None:
+            self._clear_preview()
+        else:
+            self._load_preview(current.data(PATH_ROLE))
+
+    def _on_thumbnail_ready(self, path: str, image: QImage) -> None:
+        item = self._items.get(path)
+        if item is not None:  # the file may have been removed meanwhile
+            item.setIcon(QIcon(QPixmap.fromImage(image)))
+
+    def _on_thumbnail_failed(self, path: str, message: str) -> None:
+        item = self._items.get(path)
+        if item is not None:
+            item.setIcon(self._broken_icon)
+            item.setText(f"{Path(path).name}\n(unreadable)")
+            item.setToolTip(f"{path}\n{message}")
 
     @staticmethod
-    def _image_path_from(event: QDragEnterEvent | QDropEvent) -> str | None:
-        for url in event.mimeData().urls():
-            if url.isLocalFile() and url.toLocalFile().lower().endswith(IMAGE_EXTENSIONS):
-                return url.toLocalFile()
-        return None
+    def _dropped_paths(event: QDragEnterEvent | QDropEvent) -> list[str]:
+        return [
+            url.toLocalFile()
+            for url in event.mimeData().urls()
+            if url.isLocalFile() and (os.path.isdir(url.toLocalFile()) or is_image_file(url.toLocalFile()))
+        ]
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if self._image_path_from(event):
+        if self._dropped_paths(event):
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent) -> None:
-        path = self._image_path_from(event)
-        if path:
+        paths = self._dropped_paths(event)
+        if paths:
             event.acceptProposedAction()
-            self.open_image(path)
+            self.add_files(paths)
+
+    # --- preview source --------------------------------------------------
+
+    def _load_preview(self, path: str) -> None:
+        self._load_id += 1
+        self._render_id += 1  # anything still rendering belongs to the previous image
+        self._pool.start(LoadTask(self._load_id, path, self._signals))
+
+    def _clear_preview(self) -> None:
+        self._load_id += 1
+        self._render_id += 1
+        self._source = None
+        self._source_path = None
+        self._fitted_key = self._fitted = None
+        self.compare.set_original(None)
+        self.size_label.setText("No image")
+        self.black_label.setText("True black: –")
+        self.time_label.setText("")
+        self._update_preview_state()
 
     def _on_loaded(self, request_id: int, path: str, source: np.ndarray) -> None:
         if request_id != self._load_id:
-            return  # stale: another image was opened since
+            return  # stale: another image was selected since
         self._source = source
         self._source_path = path
-        self._focus = CENTER
         self._fitted_key = self._fitted = None
         src_h, src_w = source.shape[:2]
         self.size_label.setText(f"{Path(path).name} · {src_w}×{src_h}")
         self.black_label.setText("True black: –")
-        self.statusBar().clearMessage()
-        self.export_panel.set_source(path)
         self._update_preview_state()
         self._request_render()
 
     def _on_load_failed(self, request_id: int, path: str, message: str) -> None:
         if request_id != self._load_id:
             return
-        self.statusBar().clearMessage()
-        QMessageBox.warning(self, "Could not open image", f"{Path(path).name}\n\n{message}")
+        self._source = None
+        self._source_path = None
+        self.compare.set_original(None)
+        self.size_label.setText(f"{Path(path).name} · unreadable")
+        self.black_label.setText("True black: –")
+        self.time_label.setText("")
+        self._update_preview_state()
 
     # --- preview ---------------------------------------------------------
+
+    @property
+    def _focus(self) -> tuple[float, float]:
+        return self._focus_by_path.get(self._source_path, CENTER) if self._source_path else CENTER
 
     def _rebuild_preview_combo(self) -> None:
         """List the checked output sizes; keep the current choice (by name) if still checked."""
@@ -282,7 +456,11 @@ class MainWindow(QMainWindow):
         return self._source.shape[1], self._source.shape[0]
 
     def _focus_active(self) -> bool:
-        return self.export_panel.mode() == "crop" and self._preview_target() is not None
+        return (
+            self._source is not None
+            and self.export_panel.mode() == "crop"
+            and self._preview_target() is not None
+        )
 
     def _fit_key(self) -> FitKey | None:
         src_size = self._src_size()
@@ -318,9 +496,9 @@ class MainWindow(QMainWindow):
 
     def _on_focus_clicked(self, x: float, y: float) -> None:
         src_size, target = self._src_size(), self._preview_target()
-        if src_size is None or target is None or not self._focus_active():
+        if src_size is None or target is None or self._source_path is None or not self._focus_active():
             return
-        self._focus = focus_to_center(self._focus, (x, y), src_size, target)
+        self._focus_by_path[self._source_path] = focus_to_center(self._focus, (x, y), src_size, target)
         self._request_render()
 
     def _request_render(self) -> None:
@@ -353,39 +531,83 @@ class MainWindow(QMainWindow):
 
     def _on_render_failed(self, request_id: int, message: str) -> None:
         if request_id == self._render_id:
-            self.statusBar().showMessage(f"Preview failed: {message}", 5000)
+            self.time_label.setText(f"Preview failed: {message}")
 
     # --- export ----------------------------------------------------------
 
     def _on_export_requested(self, settings: Settings, targets: list[tuple[int, int]], out_dir: str) -> None:
-        if self._source_path is None:
+        paths = self.paths()
+        if not paths or not targets:
             return
-        settings = replace(
-            settings,
-            threshold=self.threshold.value(),
-            falloff=self.falloff.value(),
-            focus=self._focus,
-        )
-        self.export_panel.set_busy(True)
-        # No showMessage() here: a status message would hide the progress bar and label.
-        self.statusBar().clearMessage()
-        self.open_folder_button.hide()
-        self.export_label.setText(f"Exporting {len(targets)} file(s)…")
-        self.export_label.show()
-        self.progress.show()
-        self._pool.start(ExportTask(self._source_path, out_dir, targets, settings, self._signals))
+        settings = replace(settings, threshold=self.threshold.value(), falloff=self.falloff.value(), focus=CENTER)
+        overrides = {
+            path: replace(settings, focus=focus)
+            for path, focus in self._focus_by_path.items()
+            if path in self._items and focus != CENTER
+        }
+        self._cancel_event = threading.Event()
 
-    def _on_export_finished(self, out_dir: str, results: list) -> None:
+        self.export_panel.set_busy(True)
+        self.open_folder_button.hide()
+        self.export_label.setText(f"Exporting {plural(len(paths), 'image')}…")
+        self.export_label.setToolTip("")
+        self.export_label.show()
+        self.progress.setRange(0, len(paths) * len(targets))
+        self.progress.setValue(0)
+        self.progress.show()
+        self.cancel_button.setText("Cancel")
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.show()
+        task = BatchExportTask(paths, out_dir, targets, settings, overrides, self._cancel_event, self._signals)
+        self._pool.start(task)
+
+    def _on_export_progress(self, done: int, total: int) -> None:
+        self.progress.setMaximum(total)
+        self.progress.setValue(done)
+
+    def _cancel_export(self) -> None:
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+            self.cancel_button.setText("Cancelling…")
+            self.cancel_button.setEnabled(False)
+
+    def _end_export(self) -> None:
         self.export_panel.set_busy(False)
         self.progress.hide()
-        self._last_export_dir = out_dir
-        self.export_label.setText(f"Exported {len(results)} file(s) to {out_dir}")
+        self.cancel_button.hide()
+        self._cancel_event = None
+
+    def _on_export_finished(self, out_dir: str, results: dict, cancelled: bool) -> None:
+        self._end_export()
+        exported = [src for src, result in results.items() if isinstance(result, list)]
+        skipped = [src for src, result in results.items() if isinstance(result, Cancelled)]
+        failed = [
+            (src, result)
+            for src, result in results.items()
+            if isinstance(result, Exception) and not isinstance(result, Cancelled)
+        ]
+
+        summary = f"{plural(len(exported), 'file')} exported, {len(failed)} failed"
+        if failed:
+            names = [src.name for src, _ in failed]
+            shown = ", ".join(names[:MAX_NAMES_IN_SUMMARY])
+            more = len(names) - MAX_NAMES_IN_SUMMARY
+            summary += f": {shown}" + (f" and {more} more" if more > 0 else "")
+        if cancelled:
+            summary += f" · cancelled, {len(skipped)} skipped"
+        self.export_label.setText(summary)
+        self.export_label.setToolTip("\n".join(f"{src.name}: {exc}" for src, exc in failed))
         self.export_label.show()
-        self.open_folder_button.show()
+
+        if exported:
+            self._last_export_dir = out_dir
+            self.open_folder_button.show()
+        if failed:
+            details = "\n".join(f"• {src.name}: {exc}" for src, exc in failed)
+            QMessageBox.warning(self, "Some images failed", f"{summary}\n\n{details}")
 
     def _on_export_failed(self, message: str) -> None:
-        self.export_panel.set_busy(False)
-        self.progress.hide()
+        self._end_export()
         self.export_label.hide()
         QMessageBox.critical(self, "Export failed", message)
 

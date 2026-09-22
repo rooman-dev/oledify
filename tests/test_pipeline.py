@@ -180,3 +180,97 @@ def test_process_file_empty_targets(tmp_path):
     src = tmp_path / "wall.png"
     Image.fromarray(gradient(9, 16)).save(src)
     assert process_file(src, tmp_path / "out", [], Settings()) == []
+
+
+# --- progress, cancel and batch --------------------------------------------
+
+import threading  # noqa: E402
+
+from oledify.core.pipeline import Cancelled, process_batch  # noqa: E402
+
+
+def write_source(path, h=90, w=160):
+    Image.fromarray(gradient(h, w)).save(path)
+    return path
+
+
+def write_corrupt(path):
+    path.write_bytes(b"this is not an image")
+    return path
+
+
+def test_process_file_reports_progress(tmp_path):
+    src = write_source(tmp_path / "wall.png")
+    calls = []
+    targets = [(64, 36), (36, 64), (100, 100), (20, 20)]
+    results = process_file(src, tmp_path / "out", targets, Settings(), on_progress=lambda d, t: calls.append((d, t)))
+    assert len(results) == 4
+    assert calls == [(1, 4), (2, 4), (3, 4), (4, 4)]  # serialised and increasing, even from threads
+
+
+def test_process_file_cancelled_before_start(tmp_path):
+    src = write_source(tmp_path / "wall.png")
+    cancel = threading.Event()
+    cancel.set()
+    calls = []
+    results = process_file(src, tmp_path / "out", [(64, 36), (36, 64)], Settings(),
+                           on_progress=lambda d, t: calls.append((d, t)), cancel=cancel)
+    assert results == []
+    assert calls == []
+    assert not (tmp_path / "out").exists() or not any((tmp_path / "out").iterdir())
+
+
+def test_process_batch_with_corrupt_file(tmp_path):
+    a = write_source(tmp_path / "a.png")
+    bad = write_corrupt(tmp_path / "bad.png")
+    c = write_source(tmp_path / "c.png")
+    targets = [(64, 36), (36, 64)]
+    calls = []
+    results = process_batch([a, bad, c], tmp_path / "out", targets, Settings(),
+                            on_progress=lambda d, t: calls.append((d, t)))
+
+    assert list(results) == [a, bad, c]
+    assert isinstance(results[bad], Exception) and not isinstance(results[bad], Cancelled)
+    for src in (a, c):
+        assert [p.name for p, _ in results[src]] == [output_name(src, w, h, "png") for w, h in targets]
+    assert len(list((tmp_path / "out").iterdir())) == 4
+
+    assert all(t == 6 for _, t in calls)
+    dones = [d for d, _ in calls]
+    assert dones == sorted(dones)
+    assert dones[-1] == 6  # the failed file still counts, so progress completes
+
+
+def test_process_batch_cancel_skips_remaining_sources(tmp_path):
+    sources = [write_source(tmp_path / f"s{i}.png") for i in range(4)]
+    cancel = threading.Event()
+
+    def on_progress(done, total):
+        if done == 2:  # first source (2 targets) finished
+            cancel.set()
+
+    results = process_batch(sources, tmp_path / "out", [(64, 36), (36, 64)], Settings(),
+                            on_progress=on_progress, cancel=cancel)
+    assert len(results[sources[0]]) == 2
+    for src in sources[1:]:
+        assert isinstance(results[src], Cancelled)
+    assert len(list((tmp_path / "out").iterdir())) == 2
+
+
+def test_process_batch_overrides_per_source(tmp_path):
+    a = write_source(tmp_path / "a.png")
+    b = write_source(tmp_path / "b.png")
+    base = Settings(deband=False)
+    overrides = {b: Settings(deband=False, focus=(1.0, 0.5))}
+    results = process_batch([a, b], tmp_path / "out", [(40, 90)], base, overrides=overrides)
+    with Image.open(results[a][0][0]) as ia, Image.open(results[b][0][0]) as ib:
+        red_a, red_b = np.array(ia)[..., 0].mean(), np.array(ib)[..., 0].mean()
+    assert red_b > red_a + 50  # b was cropped from the right (brighter) end of the gradient
+
+
+def test_process_batch_deduplicates_and_handles_no_targets(tmp_path):
+    a = write_source(tmp_path / "a.png")
+    calls = []
+    results = process_batch([a, str(a)], tmp_path / "out", [], Settings(), on_progress=lambda d, t: calls.append(1))
+    assert results == {a: []}
+    assert calls == []

@@ -1,5 +1,6 @@
 """Background tasks for the UI. Workers never touch widgets; they only emit signals."""
 
+import threading
 import time
 from pathlib import Path
 
@@ -9,10 +10,11 @@ from PySide6.QtGui import QImage
 
 from oledify.core.export import deband
 from oledify.core.oled import crush_blacks, true_black_percent
-from oledify.core.pipeline import Settings, load_image, process_file
+from oledify.core.pipeline import Settings, load_image, process_batch
 from oledify.core.resize import fit_image
 
 PREVIEW_MAX_SIDE = 1600
+THUMB_MAX_SIDE = 160
 PREVIEW_SEED = 0
 
 # (preview width, preview height, fit mode, focus): identifies one fitted preview frame
@@ -41,8 +43,13 @@ class WorkerSignals(QObject):
     # request_id, fit key, fitted array, fitted QImage, processed QImage, true black %, elapsed ms
     rendered = Signal(int, object, object, QImage, QImage, float, float)
     render_failed = Signal(int, str)
-    # output folder, [(path, stats), ...]
-    export_finished = Signal(str, object)
+    # path, thumbnail QImage / error message
+    thumbnail_ready = Signal(str, QImage)
+    thumbnail_failed = Signal(str, str)
+    # done, total targets across the batch
+    export_progress = Signal(int, int)
+    # output folder, {source Path: [(path, stats), ...] or Exception}, cancelled
+    export_finished = Signal(str, object, bool)
     export_failed = Signal(str)
 
 
@@ -103,27 +110,59 @@ class PreviewTask(QRunnable):
             self.signals.render_failed.emit(self.request_id, str(exc))
 
 
-class ExportTask(QRunnable):
-    """Run the full pipeline for every target and save the results."""
+class ThumbnailTask(QRunnable):
+    """Load a file and shrink it to a list thumbnail."""
+
+    def __init__(self, path: str, signals: WorkerSignals, max_side: int = THUMB_MAX_SIDE):
+        super().__init__()
+        self.path = path
+        self.signals = signals
+        self.max_side = max_side
+
+    def run(self) -> None:
+        try:
+            img = load_image(self.path)
+            src_h, src_w = img.shape[:2]
+            w, h = preview_size(src_w, src_h, self.max_side)
+            thumb = img if (w, h) == (src_w, src_h) else fit_image(img, w, h, mode="crop")
+            self.signals.thumbnail_ready.emit(self.path, to_qimage(thumb))
+        except Exception as exc:
+            self.signals.thumbnail_failed.emit(self.path, str(exc))
+
+
+class BatchExportTask(QRunnable):
+    """Run the full pipeline for every source and target, reporting progress."""
 
     def __init__(
         self,
-        src: str | Path,
+        sources: list[str],
         out_dir: str | Path,
         targets: list[tuple[int, int]],
         settings: Settings,
+        overrides: dict[str, Settings],
+        cancel: threading.Event,
         signals: WorkerSignals,
     ):
         super().__init__()
-        self.src = str(src)
+        self.sources = list(sources)
         self.out_dir = str(out_dir)
         self.targets = list(targets)
         self.settings = settings
+        self.overrides = dict(overrides)
+        self.cancel = cancel
         self.signals = signals
 
     def run(self) -> None:
         try:
-            results = process_file(self.src, self.out_dir, self.targets, self.settings)
-            self.signals.export_finished.emit(self.out_dir, results)
+            results = process_batch(
+                self.sources,
+                self.out_dir,
+                self.targets,
+                self.settings,
+                on_progress=self.signals.export_progress.emit,  # queued to the UI thread
+                cancel=self.cancel,
+                overrides=self.overrides,
+            )
+            self.signals.export_finished.emit(self.out_dir, results, self.cancel.is_set())
         except Exception as exc:
             self.signals.export_failed.emit(str(exc))

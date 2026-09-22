@@ -42,7 +42,7 @@ class ExportPanel(QWidget):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self._has_source = False
+        self._file_count = 0
         self._busy = False
         self._folder_chosen = False
 
@@ -150,24 +150,29 @@ class ExportPanel(QWidget):
         self._folder_chosen = True
         self._folder_edit.setText(str(folder))
 
-    def set_source(self, path: str | Path) -> None:
-        """Called when an image is loaded; defaults the folder to <source folder>/OLEDify."""
-        self._has_source = True
-        if not self._folder_chosen:
-            self._folder_edit.setText(str(Path(path).parent / OUTPUT_SUBFOLDER))
+    def set_files(self, paths: list[str]) -> None:
+        """Called when the file list changes; defaults the folder to <first file's folder>/OLEDify."""
+        self._file_count = len(paths)
+        if paths and not self._folder_chosen:
+            self._folder_edit.setText(str(Path(paths[0]).parent / OUTPUT_SUBFOLDER))
         self._update_export_enabled()
 
     def set_busy(self, busy: bool) -> None:
         self._busy = busy
-        self._export_button.setText("Exporting…" if busy else "Export")
         self._update_export_enabled()
 
     # --- internals -------------------------------------------------------
 
     def _update_export_enabled(self) -> None:
-        ready = self._has_source and not self._busy and bool(self.targets())
+        if self._busy:
+            self._export_button.setText("Exporting…")
+        elif self._file_count > 1:
+            self._export_button.setText(f"Export {self._file_count} images")
+        else:
+            self._export_button.setText("Export")
+        ready = self._file_count > 0 and not self._busy and bool(self.targets())
         self._export_button.setEnabled(ready)
-        if not self._has_source:
+        if not self._file_count:
             self._export_button.setToolTip("Open an image first")
         elif not self.targets():
             self._export_button.setToolTip("Select at least one output size")
