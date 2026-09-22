@@ -118,3 +118,14 @@ def test_input_not_mutated(mode):
     before = img.copy()
     fit_image(img, 50, 120, mode=mode)
     np.testing.assert_array_equal(img, before)
+
+
+@pytest.mark.parametrize("mode", ["bars", "blur"])
+def test_same_aspect_matches_plain_lanczos_crop(mode):
+    from PIL import Image
+
+    img = gradient(90, 160)  # 16:9
+    expected = np.array(Image.fromarray(img).resize((320, 180), Image.Resampling.LANCZOS))
+    crop = fit_image(img, 320, 180, mode="crop")
+    np.testing.assert_array_equal(crop, expected)
+    np.testing.assert_array_equal(fit_image(img, 320, 180, mode=mode), crop)
