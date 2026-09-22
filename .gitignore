@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing / tooling
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Nuitka
+*.build/
+*.dist/
+*.onefile-build/
+nuitka-crash-report.xml
+
+# Inno Setup output
+installer/Output/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
