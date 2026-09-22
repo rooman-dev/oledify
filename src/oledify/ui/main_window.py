@@ -1,16 +1,31 @@
 """Main application window: load images, tune the black crush live, export presets in batch."""
 
+import errno
 import os
 import threading
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QSize, QThreadPool, QTimer, QUrl, Qt
-from PySide6.QtGui import QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon, QImage, QPixmap
+from PIL import Image, UnidentifiedImageError
+from PySide6.QtCore import QByteArray, QSettings, QSize, QThreadPool, QTimer, QUrl, Qt
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QColor,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
+    QIcon,
+    QImage,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGroupBox,
@@ -33,7 +48,7 @@ from PySide6.QtWidgets import (
 from oledify import __version__
 from oledify.core.pipeline import Cancelled, Settings
 from oledify.core.resize import is_upscale
-from oledify.ui.compare_view import CompareView
+from oledify.ui.compare_view import DEFAULT_PLACEHOLDER, CompareView
 from oledify.ui.export_panel import ExportPanel
 from oledify.ui.worker import (
     THUMB_MAX_SIDE,
@@ -54,6 +69,69 @@ CENTER = (0.5, 0.5)
 PRESET_LABEL_ROLE = Qt.ItemDataRole.UserRole + 1
 PATH_ROLE = Qt.ItemDataRole.UserRole
 MAX_NAMES_IN_SUMMARY = 3
+SETTINGS_ORG, SETTINGS_APP = "rooman-dev", "OLEDify"
+REPO_URL = "https://github.com/rooman-dev/oledify"
+DEFAULT_THRESHOLD, DEFAULT_FALLOFF = 16, 24
+UNREADABLE_PLACEHOLDER = "Can't read this file"
+
+# Windows error codes for a full disk (ERROR_HANDLE_DISK_FULL, ERROR_DISK_FULL)
+_WIN_DISK_FULL = (39, 112)
+
+
+def friendly_message(exc: BaseException) -> str:
+    """Plain-language explanation of a load/save failure."""
+    if isinstance(exc, UnidentifiedImageError):  # subclass of OSError: check first
+        return "This file isn't an image OLEDify can read, or it's damaged."
+    if isinstance(exc, Image.DecompressionBombError):
+        return "This image is too large to open safely."
+    if isinstance(exc, MemoryError):
+        return "There isn't enough memory for this image. Close other programs or export fewer sizes at once."
+    if isinstance(exc, PermissionError):
+        return (
+            "OLEDify isn't allowed to access this file or folder. Check it isn't read-only or open "
+            "in another program, or choose a different output folder."
+        )
+    if isinstance(exc, FileNotFoundError):
+        return "The file or folder no longer exists. It may have been moved, renamed or deleted."
+    if isinstance(exc, (FileExistsError, NotADirectoryError)):
+        return "The output folder can't be used because a file with the same name is in the way."
+    if isinstance(exc, OSError) and (
+        exc.errno == errno.ENOSPC or getattr(exc, "winerror", None) in _WIN_DISK_FULL
+    ):
+        return "The disk is full. Free up some space or choose a different output folder."
+    return "Something went wrong while processing this image."
+
+
+def error_details(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+class AboutDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("About OLEDify")
+        icon = QLabel()
+        icon.setPixmap(QApplication.windowIcon().pixmap(96, 96))
+        text = QLabel(
+            f"<h2>OLEDify {__version__}</h2>"
+            "<p>Converts wallpapers for OLED and AMOLED screens:<br>"
+            "true-black crush and resize to common display sizes.</p>"
+            "<p>Runs entirely on your computer. No AI, no network access.</p>"
+            "<p>Free and open source under the MIT License.<br>"
+            f'<a href="{REPO_URL}">github.com/rooman-dev/oledify</a></p>'
+        )
+        text.setTextFormat(Qt.TextFormat.RichText)
+        text.setOpenExternalLinks(True)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept)
+
+        row = QHBoxLayout()
+        row.addWidget(icon, alignment=Qt.AlignmentFlag.AlignTop)
+        row.addSpacing(12)
+        row.addWidget(text)
+        layout = QVBoxLayout(self)
+        layout.addLayout(row)
+        layout.addWidget(buttons)
 
 
 class SliderRow(QWidget):
@@ -134,11 +212,13 @@ def plural(count: int, word: str) -> str:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, settings: QSettings | None = None):
         super().__init__()
         self.setWindowTitle(f"OLEDify {__version__}")
         self.setAcceptDrops(True)
         self.resize(1500, 880)
+        self._settings = settings if settings is not None else QSettings(SETTINGS_ORG, SETTINGS_APP)
+        self._last_open_dir = ""
 
         self._pool = QThreadPool.globalInstance()
         self._signals = WorkerSignals(self)
@@ -224,8 +304,8 @@ class MainWindow(QMainWindow):
         preview_layout.addWidget(self.upscale_label)
         preview_layout.addWidget(self.focus_hint)
 
-        self.threshold = SliderRow("Black threshold", 0, 64, 16)
-        self.falloff = SliderRow("Falloff", 0, 64, 24)
+        self.threshold = SliderRow("Black threshold", 0, 64, DEFAULT_THRESHOLD)
+        self.falloff = SliderRow("Falloff", 0, 64, DEFAULT_FALLOFF)
         for row in (self.threshold, self.falloff):
             row.slider.valueChanged.connect(self._debounce.start)
         crush_box = QGroupBox("True black")
@@ -238,12 +318,17 @@ class MainWindow(QMainWindow):
         self.export_panel.mode_changed.connect(self._on_preview_target_changed)
         self.export_panel.export_requested.connect(self._on_export_requested)
 
+        reset_button = QPushButton("Reset to defaults")
+        reset_button.clicked.connect(self.reset_to_defaults)
+
         panel = QWidget()
         panel_layout = QVBoxLayout(panel)
         panel_layout.addWidget(open_button)
         panel_layout.addWidget(preview_box)
         panel_layout.addWidget(crush_box)
         panel_layout.addWidget(self.export_panel)
+        panel_layout.addSpacing(8)
+        panel_layout.addWidget(reset_button)
         panel_layout.addStretch()
 
         scroll = QScrollArea()
@@ -286,7 +371,104 @@ class MainWindow(QMainWindow):
         status.addPermanentWidget(self.black_label)
         status.addPermanentWidget(self.time_label)
 
+        help_menu = self.menuBar().addMenu("&Help")
+        about_action = QAction("&About OLEDify", self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
+
         self._rebuild_preview_combo()
+        self._restore_settings()
+
+    # --- settings --------------------------------------------------------
+
+    def _setting(self, key: str, default, type_):
+        """Typed QSettings read that falls back to default on missing or corrupt values.
+
+        Converts the raw value itself: QSettings' own type= conversion silently turns
+        garbage into 0/False instead of failing.
+        """
+        if not self._settings.contains(key):
+            return default
+        raw = self._settings.value(key)
+        if type_ is bool:
+            if isinstance(raw, bool):
+                return raw
+            text = str(raw).strip().lower()
+            return {"true": True, "1": True, "false": False, "0": False}.get(text, default)
+        if type_ is str and isinstance(raw, list):  # INI files may split comma lists
+            return ",".join(map(str, raw))
+        try:
+            return type_(raw)
+        except (TypeError, ValueError):
+            return default
+
+    def _restore_settings(self) -> None:
+        self.threshold.slider.setValue(self._setting("crush/threshold", DEFAULT_THRESHOLD, int))
+        self.falloff.slider.setValue(self._setting("crush/falloff", DEFAULT_FALLOFF, int))
+
+        state: dict = {}
+        if self._settings.contains("export/presets"):
+            names = self._setting("export/presets", "", str)
+            state["presets"] = [name for name in names.split(",") if name]
+        for key, type_ in (
+            ("custom_enabled", bool),
+            ("custom_w", int),
+            ("custom_h", int),
+            ("mode", str),
+            ("format", str),
+            ("quality", int),
+            ("deband", bool),
+            ("folder", str),
+        ):
+            value = self._setting(f"export/{key}", None, type_)
+            if value is not None:
+                state[key] = value
+        self.export_panel.apply_state(state)
+
+        self._last_open_dir = self._setting("paths/last_open_dir", "", str)
+        self.compare.split = self._setting("view/split", 0.5, float)
+        geometry = self._settings.value("window/geometry")
+        if isinstance(geometry, QByteArray) and not geometry.isEmpty():
+            self.restoreGeometry(geometry)
+
+    def save_settings(self) -> None:
+        s = self._settings
+        s.setValue("crush/threshold", self.threshold.value())
+        s.setValue("crush/falloff", self.falloff.value())
+        state = self.export_panel.state()
+        s.setValue("export/presets", ",".join(state.pop("presets")))
+        for key, value in state.items():
+            s.setValue(f"export/{key}", value)
+        s.setValue("paths/last_open_dir", self._last_open_dir)
+        s.setValue("view/split", self.compare.split)
+        s.setValue("window/geometry", self.saveGeometry())
+        s.sync()
+
+    def reset_to_defaults(self) -> None:
+        """Reset processing, export and view options. Window size and last open folder are kept."""
+        self.threshold.slider.setValue(DEFAULT_THRESHOLD)
+        self.falloff.slider.setValue(DEFAULT_FALLOFF)
+        self.export_panel.reset_defaults()
+        self.compare.split = 0.5
+        self.save_settings()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self.save_settings()
+        super().closeEvent(event)
+
+    # --- dialogs ---------------------------------------------------------
+
+    def show_about(self) -> None:
+        AboutDialog(self).exec()
+
+    def show_error(self, title: str, text: str, details: str) -> None:
+        """Friendly message, with the raw error text behind "Show Details…"."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setDetailedText(details)
+        box.exec()
 
     # --- file list -------------------------------------------------------
 
@@ -295,8 +477,9 @@ class MainWindow(QMainWindow):
 
     def _choose_files(self) -> None:
         patterns = " ".join(f"*{ext}" for ext in IMAGE_EXTENSIONS)
-        paths, _ = QFileDialog.getOpenFileNames(self, "Open images", "", f"Images ({patterns})")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Open images", self._last_open_dir, f"Images ({patterns})")
         if paths:
+            self._last_open_dir = str(Path(paths[0]).parent)
             self.add_files(paths)
 
     def add_files(self, paths: list[str | Path]) -> list[str]:
@@ -357,12 +540,12 @@ class MainWindow(QMainWindow):
         if item is not None:  # the file may have been removed meanwhile
             item.setIcon(QIcon(QPixmap.fromImage(image)))
 
-    def _on_thumbnail_failed(self, path: str, message: str) -> None:
+    def _on_thumbnail_failed(self, path: str, exc: BaseException) -> None:
         item = self._items.get(path)
         if item is not None:
             item.setIcon(self._broken_icon)
             item.setText(f"{Path(path).name}\n(unreadable)")
-            item.setToolTip(f"{path}\n{message}")
+            item.setToolTip(f"{path}\n{friendly_message(exc)}")
 
     @staticmethod
     def _dropped_paths(event: QDragEnterEvent | QDropEvent) -> list[str]:
@@ -380,6 +563,8 @@ class MainWindow(QMainWindow):
         paths = self._dropped_paths(event)
         if paths:
             event.acceptProposedAction()
+            first = Path(paths[0])
+            self._last_open_dir = str(first if first.is_dir() else first.parent)
             self.add_files(paths)
 
     # --- preview source --------------------------------------------------
@@ -395,6 +580,7 @@ class MainWindow(QMainWindow):
         self._source = None
         self._source_path = None
         self._fitted_key = self._fitted = None
+        self.compare.set_placeholder(DEFAULT_PLACEHOLDER)
         self.compare.set_original(None)
         self.size_label.setText("No image")
         self.black_label.setText("True black: –")
@@ -413,11 +599,12 @@ class MainWindow(QMainWindow):
         self._update_preview_state()
         self._request_render()
 
-    def _on_load_failed(self, request_id: int, path: str, message: str) -> None:
+    def _on_load_failed(self, request_id: int, path: str, exc: BaseException) -> None:
         if request_id != self._load_id:
             return
         self._source = None
         self._source_path = None
+        self.compare.set_placeholder(f"{UNREADABLE_PLACEHOLDER}\n\n{friendly_message(exc)}")
         self.compare.set_original(None)
         self.size_label.setText(f"{Path(path).name} · unreadable")
         self.black_label.setText("True black: –")
@@ -596,20 +783,21 @@ class MainWindow(QMainWindow):
         if cancelled:
             summary += f" · cancelled, {len(skipped)} skipped"
         self.export_label.setText(summary)
-        self.export_label.setToolTip("\n".join(f"{src.name}: {exc}" for src, exc in failed))
+        self.export_label.setToolTip("\n".join(f"{src.name}: {friendly_message(exc)}" for src, exc in failed))
         self.export_label.show()
 
         if exported:
             self._last_export_dir = out_dir
             self.open_folder_button.show()
         if failed:
-            details = "\n".join(f"• {src.name}: {exc}" for src, exc in failed)
-            QMessageBox.warning(self, "Some images failed", f"{summary}\n\n{details}")
+            friendly = "\n".join(f"• {src.name}: {friendly_message(exc)}" for src, exc in failed)
+            details = "\n".join(f"{src}\n    {error_details(exc)}" for src, exc in failed)
+            self.show_error("Some images failed", f"{summary}\n\n{friendly}", details)
 
-    def _on_export_failed(self, message: str) -> None:
+    def _on_export_failed(self, exc: BaseException) -> None:
         self._end_export()
         self.export_label.hide()
-        QMessageBox.critical(self, "Export failed", message)
+        self.show_error("Export failed", friendly_message(exc), error_details(exc))
 
     def _open_export_folder(self) -> None:
         if not self._last_export_dir:

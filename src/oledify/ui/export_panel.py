@@ -27,6 +27,16 @@ FORMATS = ("png", "jpg", "webp")
 DEFAULT_PRESETS = ("4K",)
 OUTPUT_SUBFOLDER = "OLEDify"
 CUSTOM_MIN, CUSTOM_MAX = 16, 16384
+DEFAULT_STATE = {
+    "presets": list(DEFAULT_PRESETS),
+    "custom_enabled": False,
+    "custom_w": 1920,
+    "custom_h": 1080,
+    "mode": "crop",
+    "format": "png",
+    "quality": 95,
+    "deband": True,
+}
 
 
 class ExportPanel(QWidget):
@@ -45,6 +55,7 @@ class ExportPanel(QWidget):
         self._file_count = 0
         self._busy = False
         self._folder_chosen = False
+        self._default_folder = ""
 
         # --- output sizes ---
         sizes_box = QGroupBox("Output sizes")
@@ -153,9 +164,49 @@ class ExportPanel(QWidget):
     def set_files(self, paths: list[str]) -> None:
         """Called when the file list changes; defaults the folder to <first file's folder>/OLEDify."""
         self._file_count = len(paths)
-        if paths and not self._folder_chosen:
-            self._folder_edit.setText(str(Path(paths[0]).parent / OUTPUT_SUBFOLDER))
+        self._default_folder = str(Path(paths[0]).parent / OUTPUT_SUBFOLDER) if paths else ""
+        if not self._folder_chosen:
+            self._folder_edit.setText(self._default_folder)
         self._update_export_enabled()
+
+    def state(self) -> dict:
+        """Current options as plain values, for saving. folder is "" unless the user chose one."""
+        return {
+            "presets": [name for name, check in self._preset_checks.items() if check.isChecked()],
+            "custom_enabled": self._custom_check.isChecked(),
+            "custom_w": self._custom_w.value(),
+            "custom_h": self._custom_h.value(),
+            "mode": self.mode(),
+            "format": self._format_combo.currentText(),
+            "quality": self._quality_spin.value(),
+            "deband": self._deband_check.isChecked(),
+            "folder": self._folder_edit.text() if self._folder_chosen else "",
+        }
+
+    def apply_state(self, state: dict) -> None:
+        """Restore options from state(); missing or invalid entries keep their current value."""
+        if isinstance(state.get("presets"), list):
+            for name, check in self._preset_checks.items():
+                check.setChecked(name in state["presets"])
+        if isinstance(state.get("custom_enabled"), bool):
+            self._custom_check.setChecked(state["custom_enabled"])
+        for key, spin in (("custom_w", self._custom_w), ("custom_h", self._custom_h), ("quality", self._quality_spin)):
+            if isinstance(state.get(key), int):
+                spin.setValue(state[key])  # QSpinBox clamps out-of-range values
+        index = self._mode_combo.findData(state.get("mode"))
+        if index >= 0:
+            self._mode_combo.setCurrentIndex(index)
+        if state.get("format") in FORMATS:
+            self._format_combo.setCurrentText(state["format"])
+        if isinstance(state.get("deband"), bool):
+            self._deband_check.setChecked(state["deband"])
+        if state.get("folder"):
+            self.set_output_folder(state["folder"])
+
+    def reset_defaults(self) -> None:
+        self.apply_state(DEFAULT_STATE)
+        self._folder_chosen = False
+        self._folder_edit.setText(self._default_folder)
 
     def set_busy(self, busy: bool) -> None:
         self._busy = busy

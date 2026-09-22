@@ -5,6 +5,7 @@ from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPaintEvent, QP
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 HANDLE_GRAB_PX = 12
+DEFAULT_PLACEHOLDER = "Open or drop an image to start"
 
 
 class CompareView(QWidget):
@@ -16,8 +17,9 @@ class CompareView(QWidget):
 
     focus_clicked = Signal(float, float)
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(self, parent: QWidget | None = None, placeholder: str = DEFAULT_PLACEHOLDER):
         super().__init__(parent)
+        self._placeholder = placeholder
         self._original: QImage | None = None
         self._processed: QImage | None = None
         self._split = 0.5
@@ -44,6 +46,21 @@ class CompareView(QWidget):
         self._original = original
         self._processed = processed
         self._cache.clear()
+        self.update()
+
+    def set_placeholder(self, text: str) -> None:
+        """Text shown while no image is set."""
+        self._placeholder = text
+        self.update()
+
+    @property
+    def split(self) -> float:
+        """Split line position across the image, 0 (left edge) to 1 (right edge)."""
+        return self._split
+
+    @split.setter
+    def split(self, value: float) -> None:
+        self._split = min(1.0, max(0.0, float(value)))
         self.update()
 
     def set_focus_enabled(self, enabled: bool) -> None:
@@ -84,7 +101,7 @@ class CompareView(QWidget):
 
         if self._original is None:
             painter.setPen(QColor(140, 140, 140))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Open or drop an image to start")
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._placeholder)
             return
 
         rect = self._image_rect()

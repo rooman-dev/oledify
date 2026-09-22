@@ -10,11 +10,14 @@ from PySide6.QtGui import QImage
 
 from oledify.core.export import deband
 from oledify.core.oled import crush_blacks, true_black_percent
-from oledify.core.pipeline import Settings, load_image, process_batch
+from PIL import Image, ImageOps
+
+from oledify.core.pipeline import Settings, _to_rgb8, load_image, process_batch
 from oledify.core.resize import fit_image
 
 PREVIEW_MAX_SIDE = 1600
 THUMB_MAX_SIDE = 160
+THUMB_RESIZABLE_MODES = ("RGB", "RGBA", "L", "LA", "CMYK")
 PREVIEW_SEED = 0
 
 # (preview width, preview height, fit mode, focus): identifies one fitted preview frame
@@ -39,18 +42,19 @@ class WorkerSignals(QObject):
 
     # request_id, path, full-resolution RGB array
     loaded = Signal(int, str, object)
-    load_failed = Signal(int, str, str)
+    # request_id, path, exception
+    load_failed = Signal(int, str, object)
     # request_id, fit key, fitted array, fitted QImage, processed QImage, true black %, elapsed ms
     rendered = Signal(int, object, object, QImage, QImage, float, float)
     render_failed = Signal(int, str)
-    # path, thumbnail QImage / error message
+    # path, thumbnail QImage / exception
     thumbnail_ready = Signal(str, QImage)
-    thumbnail_failed = Signal(str, str)
+    thumbnail_failed = Signal(str, object)
     # done, total targets across the batch
     export_progress = Signal(int, int)
     # output folder, {source Path: [(path, stats), ...] or Exception}, cancelled
     export_finished = Signal(str, object, bool)
-    export_failed = Signal(str)
+    export_failed = Signal(object)
 
 
 class LoadTask(QRunnable):
@@ -66,7 +70,7 @@ class LoadTask(QRunnable):
         try:
             self.signals.loaded.emit(self.request_id, self.path, load_image(self.path))
         except Exception as exc:  # report any failure to the UI instead of dying silently
-            self.signals.load_failed.emit(self.request_id, self.path, str(exc))
+            self.signals.load_failed.emit(self.request_id, self.path, exc)
 
 
 class PreviewTask(QRunnable):
@@ -111,7 +115,11 @@ class PreviewTask(QRunnable):
 
 
 class ThumbnailTask(QRunnable):
-    """Load a file and shrink it to a list thumbnail."""
+    """Decode a file at reduced size for the list thumbnail.
+
+    Exception to "no processing in ui/": uses Pillow's draft()/thumbnail() directly
+    for speed, since core has no reduced-size loader yet. Candidate to move into core.
+    """
 
     def __init__(self, path: str, signals: WorkerSignals, max_side: int = THUMB_MAX_SIDE):
         super().__init__()
@@ -121,13 +129,17 @@ class ThumbnailTask(QRunnable):
 
     def run(self) -> None:
         try:
-            img = load_image(self.path)
-            src_h, src_w = img.shape[:2]
-            w, h = preview_size(src_w, src_h, self.max_side)
-            thumb = img if (w, h) == (src_w, src_h) else fit_image(img, w, h, mode="crop")
+            size = (self.max_side, self.max_side)
+            with Image.open(self.path) as image:
+                image.draft("RGB", size)  # JPEG: decode at 1/2, 1/4 or 1/8 scale; no-op otherwise
+                image = ImageOps.exif_transpose(image)
+                if image.mode not in THUMB_RESIZABLE_MODES:
+                    image = _to_rgb8(image)  # e.g. 16-bit or palette: convert before resizing
+                image.thumbnail(size, Image.Resampling.LANCZOS)
+                thumb = np.asarray(_to_rgb8(image), dtype=np.uint8)
             self.signals.thumbnail_ready.emit(self.path, to_qimage(thumb))
         except Exception as exc:
-            self.signals.thumbnail_failed.emit(self.path, str(exc))
+            self.signals.thumbnail_failed.emit(self.path, exc)
 
 
 class BatchExportTask(QRunnable):
@@ -165,4 +177,4 @@ class BatchExportTask(QRunnable):
             )
             self.signals.export_finished.emit(self.out_dir, results, self.cancel.is_set())
         except Exception as exc:
-            self.signals.export_failed.emit(str(exc))
+            self.signals.export_failed.emit(exc)

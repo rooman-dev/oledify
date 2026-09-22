@@ -1,12 +1,25 @@
 """Application entry point."""
 
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QGuiApplication, QPalette
+from PySide6.QtGui import QColor, QGuiApplication, QIcon, QPalette
 from PySide6.QtWidgets import QApplication
 
 from oledify import __version__
+
+# Running from source: <repo>/assets. A packaged build must ship this folder alongside.
+ASSETS_DIR = Path(__file__).resolve().parents[2] / "assets"
+
+
+def app_icon() -> QIcon:
+    """The app icon; the .ico carries 16-256 px sizes for crisp taskbar/title-bar rendering."""
+    for name in ("icon.ico", "icon.png"):
+        path = ASSETS_DIR / name
+        if path.exists():
+            return QIcon(str(path))
+    return QIcon()
 
 
 def dark_palette() -> QPalette:
@@ -45,6 +58,7 @@ def main() -> int:
     app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
     app.setPalette(dark_palette())
+    app.setWindowIcon(app_icon())
 
     from oledify.ui.main_window import MainWindow
 
