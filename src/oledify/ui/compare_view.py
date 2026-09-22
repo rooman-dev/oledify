@@ -1,6 +1,6 @@
 """Before/after view with a draggable vertical split line."""
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPaintEvent, QPen, QPixmap
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
@@ -8,7 +8,13 @@ HANDLE_GRAB_PX = 12
 
 
 class CompareView(QWidget):
-    """Shows the original left of the split line and the processed image right of it."""
+    """Shows the original left of the split line and the processed image right of it.
+
+    When focus picking is enabled, a click on the processed side emits
+    focus_clicked(x, y) with the position inside the image frame (0-1).
+    """
+
+    focus_clicked = Signal(float, float)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -16,6 +22,7 @@ class CompareView(QWidget):
         self._processed: QImage | None = None
         self._split = 0.5
         self._dragging = False
+        self._focus_enabled = False
         self._cache: dict[str, tuple[QSize, QPixmap]] = {}
         self.setMouseTracking(True)
         self.setMinimumSize(320, 200)
@@ -31,6 +38,18 @@ class CompareView(QWidget):
         self._processed = image
         self._cache.pop("processed", None)
         self.update()
+
+    def set_images(self, original: QImage, processed: QImage) -> None:
+        """Replace both sides at once (they must share the same size)."""
+        self._original = original
+        self._processed = processed
+        self._cache.clear()
+        self.update()
+
+    def set_focus_enabled(self, enabled: bool) -> None:
+        self._focus_enabled = enabled
+        if not enabled and not self._dragging:
+            self.unsetCursor()
 
     def _image_rect(self) -> QRect:
         """Largest rect with the image's aspect ratio that fits the widget, centred."""
@@ -99,10 +118,25 @@ class CompareView(QWidget):
             self._split = min(1.0, max(0.0, (x - rect.left()) / rect.width()))
             self.update()
 
+    def _on_focus_side(self, pos: QPoint) -> bool:
+        """True if pos is a focus-picking click: processed side, inside the image, off the handle."""
+        if not self._focus_enabled or self._processed is None or self._near_handle(pos):
+            return False
+        rect = self._image_rect()
+        return rect.contains(pos) and pos.x() > self._split_x(rect)
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self._original is not None:
-            self._dragging = True
-            self._move_split(event.position().toPoint().x())
+        if event.button() != Qt.MouseButton.LeftButton or self._original is None:
+            return
+        pos = event.position().toPoint()
+        if self._on_focus_side(pos):
+            rect = self._image_rect()
+            x = (pos.x() - rect.left()) / max(1, rect.width() - 1)
+            y = (pos.y() - rect.top()) / max(1, rect.height() - 1)
+            self.focus_clicked.emit(min(1.0, max(0.0, x)), min(1.0, max(0.0, y)))
+            return
+        self._dragging = True
+        self._move_split(pos.x())
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         pos = event.position().toPoint()
@@ -110,6 +144,8 @@ class CompareView(QWidget):
             self._move_split(pos.x())
         elif self._near_handle(pos):
             self.setCursor(Qt.CursorShape.SplitHCursor)
+        elif self._on_focus_side(pos):
+            self.setCursor(Qt.CursorShape.CrossCursor)
         else:
             self.unsetCursor()
 
