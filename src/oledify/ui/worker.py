@@ -10,14 +10,11 @@ from PySide6.QtGui import QImage
 
 from oledify.core.export import deband
 from oledify.core.oled import crush_blacks, true_black_percent
-from PIL import Image, ImageOps
-
-from oledify.core.pipeline import Settings, _to_rgb8, load_image, process_batch
+from oledify.core.pipeline import Settings, load_image, load_thumbnail, process_batch
 from oledify.core.resize import fit_image
 
 PREVIEW_MAX_SIDE = 1600
 THUMB_MAX_SIDE = 160
-THUMB_RESIZABLE_MODES = ("RGB", "RGBA", "L", "LA", "CMYK")
 PREVIEW_SEED = 0
 
 # (preview width, preview height, fit mode, focus): identifies one fitted preview frame
@@ -115,11 +112,7 @@ class PreviewTask(QRunnable):
 
 
 class ThumbnailTask(QRunnable):
-    """Decode a file at reduced size for the list thumbnail.
-
-    Exception to "no processing in ui/": uses Pillow's draft()/thumbnail() directly
-    for speed, since core has no reduced-size loader yet. Candidate to move into core.
-    """
+    """Load a file at reduced size for the list thumbnail."""
 
     def __init__(self, path: str, signals: WorkerSignals, max_side: int = THUMB_MAX_SIDE):
         super().__init__()
@@ -129,15 +122,7 @@ class ThumbnailTask(QRunnable):
 
     def run(self) -> None:
         try:
-            size = (self.max_side, self.max_side)
-            with Image.open(self.path) as image:
-                image.draft("RGB", size)  # JPEG: decode at 1/2, 1/4 or 1/8 scale; no-op otherwise
-                image = ImageOps.exif_transpose(image)
-                if image.mode not in THUMB_RESIZABLE_MODES:
-                    image = _to_rgb8(image)  # e.g. 16-bit or palette: convert before resizing
-                image.thumbnail(size, Image.Resampling.LANCZOS)
-                thumb = np.asarray(_to_rgb8(image), dtype=np.uint8)
-            self.signals.thumbnail_ready.emit(self.path, to_qimage(thumb))
+            self.signals.thumbnail_ready.emit(self.path, to_qimage(load_thumbnail(self.path, self.max_side)))
         except Exception as exc:
             self.signals.thumbnail_failed.emit(self.path, exc)
 

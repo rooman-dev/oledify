@@ -221,7 +221,9 @@ class MainWindow(QMainWindow):
         self._last_open_dir = ""
 
         self._pool = QThreadPool.globalInstance()
-        self._signals = WorkerSignals(self)
+        # Deliberately unparented: running tasks hold a reference, so the signal hub
+        # outlives the window and late emits from workers can't hit a deleted object.
+        self._signals = WorkerSignals()
         self._signals.loaded.connect(self._on_loaded)
         self._signals.load_failed.connect(self._on_load_failed)
         self._signals.rendered.connect(self._on_rendered)

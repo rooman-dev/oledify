@@ -15,6 +15,7 @@ from oledify.core.oled import crush_blacks, true_black_percent
 from oledify.core.resize import fit_image, is_upscale
 
 _HIGH_BIT_MODES = ("I", "I;16", "I;16B", "I;16L", "I;16N")
+_RESIZABLE_MODES = ("RGB", "RGBA", "L", "LA", "CMYK")
 
 ProgressCallback = Callable[[int, int], None]
 
@@ -52,6 +53,21 @@ def _to_rgb8(image: Image.Image) -> Image.Image:
         black = Image.new("RGBA", rgba.size, (0, 0, 0, 255))
         return Image.alpha_composite(black, rgba).convert("RGB")
     return image.convert("RGB")
+
+
+def load_thumbnail(path: str | Path, size: int = 160) -> np.ndarray:
+    """Load a small uint8 RGB copy of an image, at most size pixels on the long side.
+
+    Much faster than load_image for previews: JPEGs are decoded at reduced scale and
+    the image is never held at full resolution.
+    """
+    with Image.open(path) as image:
+        image.draft("RGB", (size, size))  # JPEG: decode at 1/2, 1/4 or 1/8 scale; no-op otherwise
+        image = ImageOps.exif_transpose(image)
+        if image.mode not in _RESIZABLE_MODES:
+            image = _to_rgb8(image)  # e.g. 16-bit or palette: convert before resizing
+        image.thumbnail((size, size), Image.Resampling.LANCZOS)
+        return np.array(_to_rgb8(image), dtype=np.uint8)
 
 
 def load_image(path: str | Path) -> np.ndarray:

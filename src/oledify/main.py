@@ -11,6 +11,7 @@ from oledify import __version__
 
 # Running from source: <repo>/assets. A packaged build must ship this folder alongside.
 ASSETS_DIR = Path(__file__).resolve().parents[2] / "assets"
+APP_USER_MODEL_ID = "rooman-dev.oledify"
 
 
 def app_icon() -> QIcon:
@@ -49,8 +50,19 @@ def dark_palette() -> QPalette:
     return palette
 
 
+def set_app_user_model_id() -> None:
+    """Windows: give the process its own identity so the taskbar shows our icon, not Python's."""
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:  # not Windows, or the call is unavailable: harmless either way
+        pass
+
+
 def main() -> int:
     """Launch OLEDify."""
+    set_app_user_model_id()
     # Qt 6 always scales for high DPI; this passes fractional factors (125%, 150%) through unrounded.
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)

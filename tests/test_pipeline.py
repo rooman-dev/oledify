@@ -274,3 +274,74 @@ def test_process_batch_deduplicates_and_handles_no_targets(tmp_path):
     results = process_batch([a, str(a)], tmp_path / "out", [], Settings(), on_progress=lambda d, t: calls.append(1))
     assert results == {a: []}
     assert calls == []
+
+
+# --- load_thumbnail ---------------------------------------------------------
+
+from oledify.core.pipeline import load_thumbnail  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "src_size, expected",
+    [((400, 200), (160, 80)), ((200, 400), (80, 160)), ((90, 160), (90, 160))],  # (h, w) -> (h, w), never enlarged
+)
+def test_load_thumbnail_max_dimension(tmp_path, src_size, expected):
+    path = tmp_path / "t.png"
+    Image.fromarray(gradient(*src_size)).save(path)
+    thumb = load_thumbnail(path, 160)
+    assert thumb.dtype == np.uint8
+    assert thumb.shape == (*expected, 3)
+    assert max(thumb.shape[:2]) <= 160
+
+
+def test_load_thumbnail_custom_size(tmp_path):
+    path = tmp_path / "t.png"
+    Image.fromarray(gradient(200, 400)).save(path)
+    assert load_thumbnail(path, 64).shape == (32, 64, 3)
+
+
+def test_load_thumbnail_exif_rotated_jpg(tmp_path):
+    src = np.zeros((200, 400, 3), dtype=np.uint8)
+    src[:, :200] = (255, 0, 0)
+    src[:, 200:] = (0, 0, 255)
+    exif = Image.Exif()
+    exif[0x0112] = 6  # display needs a 90 degree clockwise rotation
+    path = tmp_path / "r.jpg"
+    Image.fromarray(src).save(path, exif=exif, quality=95)
+
+    thumb = load_thumbnail(path, 160)
+    assert thumb.shape[0] > thumb.shape[1]  # portrait after rotation
+    top = thumb[: thumb.shape[0] // 3].reshape(-1, 3).mean(0)
+    bottom = thumb[-thumb.shape[0] // 3 :].reshape(-1, 3).mean(0)
+    assert top[0] > 200 and bottom[2] > 200  # red moved to the top, blue to the bottom
+
+
+def test_load_thumbnail_rgba_on_black(tmp_path):
+    data = np.zeros((100, 100, 4), dtype=np.uint8)
+    data[..., :3] = 200
+    data[:50, :, 3] = 255
+    path = tmp_path / "a.png"
+    Image.fromarray(data, "RGBA").save(path)
+
+    thumb = load_thumbnail(path, 50)
+    assert thumb.shape == (50, 50, 3)
+    assert thumb[:20].min() > 150  # opaque half keeps its colour
+    assert not thumb[30:].any()  # transparent half is pure black
+
+
+def test_load_thumbnail_16bit_and_palette(tmp_path):
+    png16 = tmp_path / "16.png"
+    Image.fromarray(np.full((80, 160), 32896, dtype=np.uint16)).save(png16)
+    thumb = load_thumbnail(png16, 40)
+    assert thumb.shape == (20, 40, 3)
+    assert abs(int(thumb.mean()) - 128) <= 1
+
+    pal = tmp_path / "p.png"
+    Image.fromarray(gradient(80, 160)).convert("P", palette=Image.Palette.ADAPTIVE).save(pal)
+    assert load_thumbnail(pal, 40).shape == (20, 40, 3)
+
+
+def test_load_thumbnail_rejects_corrupt_file(tmp_path):
+    bad = write_corrupt(tmp_path / "bad.png")
+    with pytest.raises(Exception):
+        load_thumbnail(bad)
