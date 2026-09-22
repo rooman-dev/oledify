@@ -96,6 +96,11 @@ def fit_image(
     if mode == "crop":
         return np.array(_cover(src, target_w, target_h, focus), dtype=np.uint8)
 
+    foreground = _contain(src, target_w, target_h)
+    fg_w, fg_h = foreground.size
+    if (fg_w, fg_h) == (target_w, target_h):
+        return np.array(foreground, dtype=np.uint8)
+
     if mode == "bars":
         canvas = Image.new("RGB", (target_w, target_h), (0, 0, 0))
     else:
@@ -103,7 +108,5 @@ def fit_image(
         background = background.filter(ImageFilter.GaussianBlur(BLUR_RADIUS_FRACTION * target_w))
         canvas = Image.eval(background, lambda v: round(v * BLUR_BRIGHTNESS))
 
-    foreground = _contain(src, target_w, target_h)
-    fg_w, fg_h = foreground.size
     canvas.paste(foreground, ((target_w - fg_w) // 2, (target_h - fg_h) // 2))
     return np.array(canvas, dtype=np.uint8)
