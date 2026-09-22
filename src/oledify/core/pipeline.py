@@ -91,5 +91,5 @@ def process_file(
         path = out_dir / output_name(src, target_w, target_h, settings.fmt)
         return save_image(out, path, fmt=settings.fmt, quality=settings.quality), stats
 
-    with ThreadPoolExecutor(max_workers=min(len(targets), os.cpu_count() or 4)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(targets), os.cpu_count() or 4, 4)) as pool:
         return list(pool.map(run, targets))
