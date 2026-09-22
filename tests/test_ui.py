@@ -80,8 +80,11 @@ def test_newest_render_wins_after_burst(window, qtbot, make_file):
     for threshold in (5, 20, 40, 60):  # queue several renders at once, bypassing the debounce
         window.threshold.slider.setValue(threshold)
         window._request_render()
-    settle(window, qtbot)
-    qtbot.wait(300)  # give any straggler a chance to overwrite the result
+
+    # Let every queued render finish (they complete out of order), then flush their
+    # queued signals. Waiting a fixed time here is what made this test flaky.
+    qtbot.waitUntil(lambda: window._pool.waitForDone(50), timeout=RENDER_TIMEOUT_MS)
+    qtbot.wait(200)
 
     # The status bar must show the last threshold's result, not an earlier, faster one.
     expected = true_black_percent(deband(crush_blacks(window._fitted, threshold=60, falloff=24), seed=0))
