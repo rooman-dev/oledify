@@ -9,18 +9,41 @@ from PySide6.QtWidgets import QApplication
 
 from oledify import __version__
 
-# Running from source: <repo>/assets. A packaged build must ship this folder alongside.
-ASSETS_DIR = Path(__file__).resolve().parents[2] / "assets"
+# Running from source: <repo>/assets. A packaged build ships assets next to the executable.
+SOURCE_ASSETS_DIR = Path(__file__).resolve().parents[2] / "assets"
 APP_USER_MODEL_ID = "rooman-dev.oledify"
+
+
+def is_packaged() -> bool:
+    """True inside a Nuitka (or other frozen) build, where __file__ is not the source tree."""
+    return globals().get("__compiled__") is not None or getattr(sys, "frozen", False)
+
+
+def asset_dirs() -> list[Path]:
+    """Folders to look for bundled assets in, most specific first."""
+    dirs = []
+    if is_packaged():
+        dirs.append(Path(sys.executable).resolve().parent / "assets")
+    dirs.append(SOURCE_ASSETS_DIR)
+    return dirs
+
+
+def find_asset(name: str) -> Path | None:
+    """Path of a bundled asset, or None if it isn't there."""
+    for directory in asset_dirs():
+        path = directory / name
+        if path.exists():
+            return path
+    return None
 
 
 def app_icon() -> QIcon:
     """The app icon; the .ico carries 16-256 px sizes for crisp taskbar/title-bar rendering."""
     for name in ("icon.ico", "icon.png"):
-        path = ASSETS_DIR / name
-        if path.exists():
+        path = find_asset(name)
+        if path is not None:
             return QIcon(str(path))
-    return QIcon()
+    return QIcon()  # missing assets: no icon, but the app still runs
 
 
 def dark_palette() -> QPalette:
