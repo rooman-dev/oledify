@@ -1,5 +1,7 @@
 """Processing pipeline: load -> fit -> crush -> deband -> save. No Qt."""
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +24,7 @@ class Settings:
     deband: bool = True
     fmt: str = "png"
     quality: int = 95
+    seed: int | None = None
 
 
 def _to_rgb8(image: Image.Image) -> Image.Image:
@@ -56,7 +59,7 @@ def process(img: np.ndarray, target_w: int, target_h: int, settings: Settings) -
     out = fit_image(img, target_w, target_h, mode=settings.mode, focus=settings.focus)
     out = crush_blacks(out, threshold=settings.threshold, falloff=settings.falloff)
     if settings.deband:
-        out = deband(out)
+        out = deband(out, seed=settings.seed)
     stats = {
         "true_black_percent": true_black_percent(out),
         "upscaled": is_upscale(src_w, src_h, target_w, target_h, settings.mode),
@@ -72,12 +75,21 @@ def process_file(
     targets: list[tuple[int, int]],
     settings: Settings,
 ) -> list[tuple[Path, dict]]:
-    """Load src once, then process and save it for each (width, height) target."""
+    """Load src once, then process and save it for each (width, height) target.
+
+    Targets run in parallel threads (NumPy and Pillow release the GIL for the heavy
+    work); results are returned in the same order as targets.
+    """
+    if not targets:
+        return []
     img = load_image(src)
     out_dir = Path(out_dir)
-    results = []
-    for target_w, target_h in targets:
+
+    def run(target: tuple[int, int]) -> tuple[Path, dict]:
+        target_w, target_h = target
         out, stats = process(img, target_w, target_h, settings)
         path = out_dir / output_name(src, target_w, target_h, settings.fmt)
-        results.append((save_image(out, path, fmt=settings.fmt, quality=settings.quality), stats))
-    return results
+        return save_image(out, path, fmt=settings.fmt, quality=settings.quality), stats
+
+    with ThreadPoolExecutor(max_workers=min(len(targets), os.cpu_count() or 4)) as pool:
+        return list(pool.map(run, targets))

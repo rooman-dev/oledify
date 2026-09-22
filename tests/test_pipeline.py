@@ -154,3 +154,29 @@ def test_process_file_writes_one_file_per_target(tmp_path, fmt):
         assert stats["out_size"] == (w, h)
         with Image.open(path) as saved:
             assert saved.size == (w, h)
+
+
+def test_process_same_seed_with_deband_is_identical():
+    img = gradient(90, 160)
+    settings = Settings(deband=True, seed=123)
+    a, _ = process(img, 64, 36, settings)
+    b, _ = process(img, 64, 36, settings)
+    np.testing.assert_array_equal(a, b)
+    c, _ = process(img, 64, 36, Settings(deband=True, seed=124))
+    assert not np.array_equal(a, c)  # the seed really reaches deband
+
+
+def test_process_file_order_matches_targets(tmp_path):
+    src = tmp_path / "wall.png"
+    Image.fromarray(gradient(90, 160)).save(src)
+    # Largest first, so later (smaller, faster) targets would finish first if order leaked.
+    targets = [(1200, 900), (8, 8), (640, 360), (16, 64), (300, 300), (32, 18)]
+    results = process_file(src, tmp_path / "out", targets, Settings())
+    assert [stats["out_size"] for _, stats in results] == targets
+    assert [path.name for path, _ in results] == [output_name(src, w, h, "png") for w, h in targets]
+
+
+def test_process_file_empty_targets(tmp_path):
+    src = tmp_path / "wall.png"
+    Image.fromarray(gradient(9, 16)).save(src)
+    assert process_file(src, tmp_path / "out", [], Settings()) == []

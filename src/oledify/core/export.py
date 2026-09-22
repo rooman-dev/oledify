@@ -43,12 +43,12 @@ def output_name(src_path: str | Path, w: int, h: int, fmt: str) -> str:
 
 def _save_options(fmt: str, quality: int) -> dict:
     if fmt == "png":
-        return {"optimize": True}
+        return {"compress_level": 6}
     if fmt == "jpg":
         return {"quality": quality, "subsampling": 0}
     if quality == 100:
-        return {"lossless": True, "method": 6}
-    return {"quality": quality, "method": 6}
+        return {"lossless": True, "method": 4}
+    return {"quality": quality, "method": 4}
 
 
 def save_image(img: np.ndarray, path: str | Path, fmt: str = "png", quality: int = 95) -> Path:
